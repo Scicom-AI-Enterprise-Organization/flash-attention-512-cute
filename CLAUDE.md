@@ -178,10 +178,22 @@ H=8/Hkv=4, D=512, bf16, causal, single H100 80GB (outputs/grads match within bf1
 → **~5–7× faster fwd+bwd** (~20–90× forward-only), **~25–40% less memory** than the tiled
 SDPA fallback, and it avoids the naive-SDPA O(H·S²) OOM entirely — 128k context fits on one
 80GB H100 (~41 GB), leaving room for ~192k. The non-fused recompute backward is the current
-bottleneck (a fused chunked bwd kernel would widen the gap further). The packed-varlen case
-(Gemma 4's actual training; per-document block-causal) shows the same ~7× speedup / lower
-memory — e.g. 65536 packed tokens (doc_len 2048): FA-512 20.8 GB / 869 ms vs SDPA-tiled
-27.4 GB / 6714 ms. Reproduce: `cd dev512 && python compare_attn.py` (dense) and
+bottleneck (a fused chunked bwd kernel would widen the gap further).
+
+**Packed varlen** — this is what Gemma 4 training actually does: documents packed to `total`
+tokens with per-document block-causal attention (cu_seqlens). FA-512 via
+`flash_attn_varlen_func` vs the SDPA-512 fallback (`_packed_sdpa_full`, same cu_seqlens),
+fwd+bwd, doc_len=2048, H=8/Hkv=4, D=512, bf16, H100 80GB (outputs match within bf16 tol):
+
+| total tokens | FA-512 mem / fwd+bwd | SDPA-tiled mem / fwd+bwd | speedup |
+|-------------:|---------------------:|-------------------------:|--------:|
+|         8192 |   2.6 GB /    17 ms  |    3.0 GB /   108 ms     |  ~6.2×  |
+|        16384 |   5.2 GB /    60 ms  |    6.1 GB /   421 ms     |  ~7.1×  |
+|        32768 |  10.4 GB /   222 ms  |   12.7 GB /  1694 ms     |  ~7.6×  |
+|        65536 |  20.8 GB /   869 ms  |   27.4 GB /  6714 ms     |  ~7.7×  |
+
+Same ~7× fwd+bwd speedup and ~25% lower memory as the dense case — the packing (block-diagonal
+mask) doesn't change the win. Reproduce: `cd dev512 && python compare_attn.py` (dense) and
 `python compare_attn_varlen.py` (packed) — both copy `gemma4_dynamic_attention.py` from the autotrain repo.
 
 **Testing / dev** (cannot run on local Ampere — needs SM90). All in `dev512/`:
