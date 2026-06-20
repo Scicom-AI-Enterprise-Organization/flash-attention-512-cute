@@ -58,8 +58,10 @@ already N-split dK/dV/dQ across 2 warpgroups (atoms become 256, so it *compiles*
 at *launch* with `cudaErrorInvalidValue` (smem over the limit). dK+dV register accumulators
 (`[tile_n,512]` each) are also a pressure point.
 
-Current solution (`interface.py`): `FlashAttnFunc.backward` routes `head_dim > 256` to
-`_flash_attn_bwd_large_headdim` — an exact recompute backward:
+Current solution (`interface.py`): both `FlashAttnFunc.backward` and
+`FlashAttnVarlenFunc.backward` route `head_dim > 256` to `_flash_attn_bwd_large_headdim`
+— an exact recompute backward (varlen builds a per-document block-causal mask from
+cu_seqlens, so Gemma 4's packed training is covered):
 - Blocks over the query dim (`q_block=1024`), so the `s_q×s_k` scores are never fully materialised.
 - bf16 tensor-core matmuls (fp32 accumulation, matching the kernel) + fp32 softmax & cross-block
   gradient accumulation. Causal block-skipping (only keys up to the diagonal).
@@ -102,9 +104,18 @@ fits on one 80GB H100 (~41 GB). The recompute bwd is the bottleneck — a fused 
 kernel (above) would widen the gap. `gemma4_dynamic_attention.py` is copied from the
 autotrain repo so the comparison is self-contained.
 
+## End-to-end logits validation (real Gemma 4)
+
+`dev512/compare_logits_fa4.py` loads `google/gemma-4-31B-it` twice: once with all attention
+layers routed through this repo's FA4 varlen kernel (`gemma4_fa4_attention.py`, registered via
+transformers `AttentionInterface`), once with the default attention. On a short single-document
+prompt the logits match: argmax + top-5 identical, **cosine 0.99914** (bf16 noise). So FA-512 is a
+verified drop-in for Gemma 4's attention end-to-end (head_dim=512 global + 256 sliding layers).
+Needs `HF_TOKEN` + ~62 GB model on an 80 GB H100.
+
 ## Verification
 
-- `dev512/check.py` — fwd/bwd vs fp32 torch reference (args: `--d --dv --causal --hq --hkv --sq --sk --dtype --bwd`).
+- `dev512/check.py` / `dev512/check_varlen.py` — dense / packed-varlen fwd/bwd vs torch reference (args: `--d --dv --causal --hq --hkv --sq --sk --dtype --bwd`).
 - `dev512/bench.py` — TFLOPS for fwd/bwd.
 - `dev512/test_hdim512.py` — pytest, 36 cases (dtype × causal × GQA/MHA/MQA × seqlen), all pass.
   Run from `dev512/`: `cd dev512 && pytest test_hdim512.py -q` (so the installed `flash-attn-4`

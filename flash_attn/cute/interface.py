@@ -1092,6 +1092,8 @@ def _flash_attn_bwd_large_headdim(
     causal: bool = False,
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
     q_block: int = 1024,
 ):
     """Memory-efficient exact backward for head_dim that the SM90 fused bwd kernel
@@ -1105,7 +1107,14 @@ def _flash_attn_bwd_large_headdim(
 
     Does not support softcap / learnable_sink / score_mod / mask_mod (none are used by
     Gemma 4 attention); the caller routes those cases to the fused kernel.
+
+    When cu_seqlens_q is given, q/k/v/out/dout are packed varlen (total_tokens, h, d) and
+    attention is per-document block-causal (no cross-document attention), matching Gemma 4
+    packed training. Assumes self-attention (cu_seqlens_q == cu_seqlens_k).
     """
+    is_varlen = cu_seqlens_q is not None
+    if is_varlen:
+        q, k, v, out, dout = (t.unsqueeze(0) for t in (q, k, v, out, dout))
     b, sq, hq, d = q.shape
     sk = k.shape[1]
     hkv = k.shape[2]
@@ -1113,6 +1122,13 @@ def _flash_attn_bwd_large_headdim(
     g = hq // hkv
     in_dtype = q.dtype
     dev = q.device
+
+    doc_q = doc_k = None
+    if is_varlen:
+        cuq = cu_seqlens_q.to(device=dev).long()
+        cuk = cu_seqlens_k.to(device=dev).long()
+        doc_q = torch.repeat_interleave(torch.arange(cuq.numel() - 1, device=dev), cuq[1:] - cuq[:-1])
+        doc_k = torch.repeat_interleave(torch.arange(cuk.numel() - 1, device=dev), cuk[1:] - cuk[:-1])
 
     # Matmuls run in the input dtype on tensor cores (fp32 accumulation, matching
     # the kernel's bf16-storage / fp32-accumulate MMAs); softmax and the cross-block
@@ -1139,7 +1155,7 @@ def _flash_attn_bwd_large_headdim(
 
     # bottom-right alignment offset (query i sees key i + offset)
     offset = sk - sq
-    masked = causal or window_size_left is not None or window_size_right is not None
+    masked = causal or window_size_left is not None or window_size_right is not None or is_varlen
     pure_causal = causal and window_size_left is None and window_size_right is None
     j_full = torch.arange(sk, device=dev).view(1, sk)
     for q0 in range(0, sq, q_block):
@@ -1165,6 +1181,8 @@ def _flash_attn_bwd_large_headdim(
                     mask |= j_idx > i_idx + wr
             if window_size_left is not None:
                 mask |= j_idx < i_idx - window_size_left
+            if is_varlen:  # drop cross-document keys (per-document block-causal)
+                mask |= doc_q[q0:q1].view(-1, 1) != doc_k[:kmax].view(1, -1)
             s = s.masked_fill(mask.view(1, 1, q1 - q0, kmax), float("-inf"))
         p = torch.softmax(s, dim=-1)             # (b, hq, bm, kmax) fp32
         p_cast = p.to(in_dtype)
@@ -1188,6 +1206,8 @@ def _flash_attn_bwd_large_headdim(
     dq_o = dq.transpose(1, 2).contiguous().to(in_dtype)
     dk_o = dk.transpose(1, 2).contiguous().to(in_dtype)
     dv_o = dvv.transpose(1, 2).contiguous().to(in_dtype)
+    if is_varlen:  # back to packed (total_tokens, h, d)
+        dq_o, dk_o, dv_o = dq_o.squeeze(0), dk_o.squeeze(0), dv_o.squeeze(0)
     return dq_o, dk_o, dv_o
 
 
@@ -1994,6 +2014,28 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             dlse = None
         if dout is None:
             dout = torch.zeros_like(out)
+        if q.shape[-1] > 256 or v.shape[-1] > 256:
+            # head_dim > 256 (Gemma 4 head_dim=512 global layers) does not fit the fused
+            # SM90 bwd kernel; use the memory-efficient per-document recompute backward.
+            assert ctx.softcap == 0.0, "softcap is not supported for head_dim > 256 backward"
+            assert dlse is None, "return_lse grad is not supported for head_dim > 256 backward"
+            assert seqused_q is None and seqused_k is None, (
+                "seqused_q/seqused_k are not supported for head_dim > 256 varlen backward"
+            )
+            dq, dk, dv = _flash_attn_bwd_large_headdim(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                ctx.softmax_scale,
+                causal=ctx.causal,
+                window_size_left=ctx.window_size[0],
+                window_size_right=ctx.window_size[1],
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+            )
+            return dq, dk, dv, *((None,) * 30)
         dq, dk, dv = _flash_attn_bwd(
             q,
             k,
