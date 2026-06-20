@@ -88,11 +88,16 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
     is_deepseek_mla_absorbed_shape = head_dim == 64  and head_dim_v == 512
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
-    is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
+    # SM90 supports 8..256, plus head_dim 512 (e.g. Gemma 4 global layers): the
+    # forward kernel splits head_dim_v=512 across 2 warpgroups, and the backward
+    # uses a memory-efficient recompute path for head_dim > 256.
+    is_sm90_range = (8 <= head_dim <= 256 or head_dim == 512) and (
+        8 <= head_dim_v <= 256 or head_dim_v == 512
+    )
     if compute_capability == 9:
         assert is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM90. "
-            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
+            f"head_dim and head_dim_v must be between 8 and 256 (or exactly 512) and divisible by {alignment}."
         )
     elif compute_capability in [10, 11]:
         assert (is_standard_range or is_deepseek_shape or is_deepseek_mla_absorbed_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
@@ -139,9 +144,15 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
     elif head_dim <= 192:
         tile_n = 96 if is_local else (128 if head_dim_v <= 128 else 112)
         return FwdConfig(128, tile_n, True, True)
-    else:  # hdim 256
+    elif head_dim <= 256:
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
+    else:  # hdim 512 (e.g. Gemma 4 global layers)
+        # tile_m must be 64: a [128, 512] bf16 Q tile alone is 128KB of smem, and
+        # the O[tile_m, 512] fp32 accumulator dominates register pressure (split
+        # across 2 warpgroups by the SM90 kernel). tile_n=80 keeps Q+K+V (num_stages=1)
+        # at ~224KB, just under SM90's 227KB smem.
+        return FwdConfig(64, 80, True, True)
 
 @dataclass(frozen=True)
 class BwdConfig:
@@ -215,8 +226,17 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
                 num_wg=2,
             )
-    else:
+    elif head_dim <= 256:
         # hdim 256
+        return BwdConfig(
+            m_block_size=64, n_block_size=64,
+            num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
+            SdP_swapAB=False, dKV_swapAB=False, dQ_swapAB=False,
+            AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+        )
+    else:
+        # hdim 512 (e.g. Gemma 4 global layers). num_wg=2 N-splits the dK/dV/dQ
+        # head_dim across warpgroups so each WGMMA atom N is 256 (=512/2).
         return BwdConfig(
             m_block_size=64, n_block_size=64,
             num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
@@ -749,8 +769,8 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                # num_stages=1,
-                num_stages=2,
+                # head_dim=512 needs num_stages=1 to fit K+V+Q tiles in smem.
+                num_stages=1 if head_dim > 256 else 2,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
@@ -1060,6 +1080,115 @@ def _bwd_postprocess_convert(
 
 
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
+
+
+def _flash_attn_bwd_large_headdim(
+    q: torch.Tensor,        # (b, sq, hq, d)
+    k: torch.Tensor,        # (b, sk, hkv, d)
+    v: torch.Tensor,        # (b, sk, hkv, dv)
+    out: torch.Tensor,      # (b, sq, hq, dv)
+    dout: torch.Tensor,     # (b, sq, hq, dv)
+    softmax_scale: float,
+    causal: bool = False,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    q_block: int = 1024,
+):
+    """Memory-efficient exact backward for head_dim that the SM90 fused bwd kernel
+    cannot fit in shared memory (head_dim > 256, e.g. Gemma 4 global layers,
+    head_dim=512).
+
+    Recomputes the softmax block-by-block over the query dimension (so the s_q x s_k
+    score matrix is never fully materialised) using cuBLAS matmuls. Correct but not at
+    fused-kernel speed; intended for the ~1/6 of Gemma 4 layers that are global. The
+    fused chunked SM90 kernel is the performance follow-up.
+
+    Does not support softcap / learnable_sink / score_mod / mask_mod (none are used by
+    Gemma 4 attention); the caller routes those cases to the fused kernel.
+    """
+    b, sq, hq, d = q.shape
+    sk = k.shape[1]
+    hkv = k.shape[2]
+    dv = v.shape[-1]
+    g = hq // hkv
+    in_dtype = q.dtype
+    dev = q.device
+
+    # Matmuls run in the input dtype on tensor cores (fp32 accumulation, matching
+    # the kernel's bf16-storage / fp32-accumulate MMAs); softmax and the cross-block
+    # gradient accumulation stay in fp32 for numerical stability.
+    # Move heads to the front: (b, h, s, d)
+    qb_all = q.transpose(1, 2)              # (b, hq, sq, d)
+    of = out.float().transpose(1, 2)        # (b, hq, sq, dv)
+    dob_all = dout.transpose(1, 2)          # (b, hq, sq, dv)
+    # Expand kv heads to query heads for the matmuls.
+    kt = k.transpose(1, 2)                   # (b, hkv, sk, d)
+    vt = v.transpose(1, 2)                   # (b, hkv, sk, dv)
+    if g != 1:
+        kf_e = kt.repeat_interleave(g, dim=1)   # (b, hq, sk, d)
+        vf_e = vt.repeat_interleave(g, dim=1)
+    else:
+        kf_e, vf_e = kt, vt
+
+    # delta_i = sum_j dO_ij * O_ij  (over dv)
+    delta = (dob_all.float() * of).sum(-1)  # (b, hq, sq)
+
+    dq = torch.zeros((b, hq, sq, d), dtype=torch.float32, device=dev)
+    dk_e = torch.zeros((b, hq, sk, d), dtype=torch.float32, device=dev)
+    dv_e = torch.zeros((b, hq, sk, dv), dtype=torch.float32, device=dev)
+
+    # bottom-right alignment offset (query i sees key i + offset)
+    offset = sk - sq
+    masked = causal or window_size_left is not None or window_size_right is not None
+    pure_causal = causal and window_size_left is None and window_size_right is None
+    j_full = torch.arange(sk, device=dev).view(1, sk)
+    for q0 in range(0, sq, q_block):
+        q1 = min(q0 + q_block, sq)
+        # For pure-causal, queries in [q0, q1) only attend to keys [0, q1 + offset),
+        # so skip computing the strictly-upper-triangular key columns entirely.
+        kmax = min(sk, q1 + offset) if pure_causal else sk
+        qb = qb_all[:, :, q0:q1]                  # (b, hq, bm, d)
+        dob = dob_all[:, :, q0:q1]                # (b, hq, bm, dv)
+        deltab = delta[:, :, q0:q1].unsqueeze(-1)  # (b, hq, bm, 1)
+        kf_b = kf_e[:, :, :kmax]
+        vf_b = vf_e[:, :, :kmax]
+        s = torch.matmul(qb, kf_b.transpose(-1, -2)).float() * softmax_scale  # (b, hq, bm, kmax)
+        if masked:
+            i_idx = torch.arange(q0, q1, device=dev).view(-1, 1) + offset  # (bm,1)
+            j_idx = j_full[:, :kmax]
+            mask = torch.zeros((q1 - q0, kmax), dtype=torch.bool, device=dev)
+            if causal or window_size_right is not None:
+                wr = window_size_right if (window_size_right is not None and not causal) else 0
+                if causal and window_size_right is None:
+                    mask |= j_idx > i_idx
+                else:
+                    mask |= j_idx > i_idx + wr
+            if window_size_left is not None:
+                mask |= j_idx < i_idx - window_size_left
+            s = s.masked_fill(mask.view(1, 1, q1 - q0, kmax), float("-inf"))
+        p = torch.softmax(s, dim=-1)             # (b, hq, bm, kmax) fp32
+        p_cast = p.to(in_dtype)
+        # dV += P^T @ dO
+        dv_e[:, :, :kmax] += torch.matmul(p_cast.transpose(-1, -2), dob).float()
+        # dP = dO @ V^T ; dS = P * (dP - delta) * scale
+        dp = torch.matmul(dob, vf_b.transpose(-1, -2)).float()   # (b, hq, bm, kmax)
+        ds = (p * (dp - deltab) * softmax_scale).to(in_dtype)
+        # dQ = dS @ K ; dK += dS^T @ Q
+        dq[:, :, q0:q1] = torch.matmul(ds, kf_b).float()
+        dk_e[:, :, :kmax] += torch.matmul(ds.transpose(-1, -2), qb).float()
+
+    # Reduce expanded kv-head grads back to hkv heads.
+    if g != 1:
+        dk = dk_e.view(b, hkv, g, sk, d).sum(2)
+        dvv = dv_e.view(b, hkv, g, sk, dv).sum(2)
+    else:
+        dk, dvv = dk_e, dv_e
+
+    # Back to (b, s, h, d) and input dtype.
+    dq_o = dq.transpose(1, 2).contiguous().to(in_dtype)
+    dk_o = dk.transpose(1, 2).contiguous().to(in_dtype)
+    dv_o = dvv.transpose(1, 2).contiguous().to(in_dtype)
+    return dq_o, dk_o, dv_o
 
 
 def _flash_attn_bwd(
@@ -1755,6 +1884,24 @@ class FlashAttnFunc(torch.autograd.Function):
             dlse = None
         if dout is None:
             dout = torch.zeros_like(out)
+        if q.shape[-1] > 256 or v.shape[-1] > 256:
+            # The fused SM90 backward kernel cannot fit head_dim > 256 in shared
+            # memory; use the memory-efficient recompute backward instead (e.g.
+            # Gemma 4 head_dim=512 global layers). See _flash_attn_bwd_large_headdim.
+            assert ctx.softcap == 0.0, "softcap is not supported for head_dim > 256 backward"
+            assert dlse is None, "return_lse grad is not supported for head_dim > 256 backward"
+            dq, dk, dv = _flash_attn_bwd_large_headdim(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                ctx.softmax_scale,
+                causal=ctx.causal,
+                window_size_left=ctx.window_size[0],
+                window_size_right=ctx.window_size[1],
+            )
+            return dq, dk, dv, *((None,) * 30)
         dq, dk, dv = _flash_attn_bwd(
             q,
             k,

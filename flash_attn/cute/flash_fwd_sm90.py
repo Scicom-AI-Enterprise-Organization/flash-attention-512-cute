@@ -93,6 +93,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return sQ_layout_atom, sK_layout_atom, sV_layout_atom, sO_layout_atom, sP_layout_atom
 
     def _get_tiled_mma(self):
+        # Split head_dim_v across 2 warpgroups when it exceeds the WGMMA N-mode cap (256).
+        self.pv_n_split = 2 if self.tile_hdimv > 256 else 1
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
@@ -108,8 +110,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.MN,
             Float32,
-            atom_layout_mnk=(self.tile_m // 64, 1, 1),  # Might need (1, 2, 1) for hdim 512
-            tiler_mn=(64, self.tile_hdimv),
+            # WGMMA N-mode is capped at 256. For head_dim_v > 256 (Gemma 4 global
+            # layers) we split head_dim_v across 2 warpgroups (atom N = 256), which
+            # also halves the O[tile_m, head_dim_v] fp32 accumulator register
+            # pressure (256 -> 128 regs/thread). Each warpgroup redundantly
+            # recomputes the full QK^T/softmax and owns one head_dim_v half of O.
+            atom_layout_mnk=(self.tile_m // 64, self.pv_n_split, 1),
+            tiler_mn=(64, self.tile_hdimv // self.pv_n_split),
             a_source=warpgroup.OperandSource.RMEM
             if self.mma_pv_is_rs
             else warpgroup.OperandSource.SMEM,
@@ -203,7 +210,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
 
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
-        self.num_mma_threads = tiled_mma_qk.size
+        # With the head_dim_v N-split, PV spans more warpgroups than QK; the QK gemm
+        # is then redundantly replicated across warpgroups (each computes the full S).
+        self.num_mma_threads = max(tiled_mma_qk.size, tiled_mma_pv.size)
+        self.qk_wg_replicated = tiled_mma_qk.size < self.num_mma_threads
         self.num_threads_per_warp_group = 128
         self.num_wg_mma = self.num_mma_threads // self.num_threads_per_warp_group
         assert self.num_wg_mma in [1, 2, 3]
@@ -956,8 +966,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         warp_group_thread_layout = cute.make_layout(
             self.num_wg_mma, stride=self.num_threads_per_warp_group
         )
-        thr_mma_qk = tiled_mma_qk.get_slice(tidx)
-        wg_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx))
+        # When QK is replicated across warpgroups (head_dim_v N-split), map every
+        # warpgroup's threads onto the single-warpgroup QK MMA so each computes the
+        # full QK^T / softmax identically.
+        qk_tidx = tidx % tiled_mma_qk.size if const_expr(self.qk_wg_replicated) else tidx
+        thr_mma_qk = tiled_mma_qk.get_slice(qk_tidx)
+        wg_mma_qk = tiled_mma_qk.get_slice(
+            0 if const_expr(self.qk_wg_replicated) else warp_group_thread_layout(warp_group_idx)
+        )
         wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx))
         _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
             wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ, sK

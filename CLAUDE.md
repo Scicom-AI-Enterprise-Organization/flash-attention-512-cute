@@ -8,6 +8,8 @@ FlashAttention-4 (FA4) — fast, memory-efficient exact attention kernels writte
 
 The repository also contains older generations (FA2 in top-level `csrc/`, FA3 in `hopper/`) but active development is on FA4 in `flash_attn/cute/`.
 
+**This fork adds symmetric `head_dim=512` support on Hopper (SM90)** for Gemma 4's global-attention layers (Gemma 4 uses `head_dim=256` for sliding layers and `global_head_dim=512` for the ~1/6 global layers; GQA, causal). See the "head_dim=512 (Gemma 4)" section below.
+
 ## Agent Scratch Space
 
 Use `agent_space/` for project-local scratch work such as lab notes, profiling outputs, temporary repro scripts, and experiment artifacts. Treat it as disposable workspace rather than product code.
@@ -21,6 +23,12 @@ pip install -e "flash_attn/cute[dev]"
 ```
 
 Dependencies: `nvidia-cutlass-dsl>=4.4.1`, `torch`, `einops`, `apache-tvm-ffi`, `quack-kernels>=0.2.10`.
+
+> **Version pin (important):** the `>=` bounds let `pip` pull *too-new* deps that break with API skew (quack 0.5.0 dropped the `arch` arg in `get_smem_store_C`; cutlass-dsl 4.5.x renamed `cutlass.base_dsl.Arch`). The combo that works with this tree (HEAD ~2026-04) on H100 / torch 2.8 / py3.12 is:
+> ```bash
+> pip install -e "flash_attn/cute[dev]"
+> pip install "nvidia-cutlass-dsl==4.4.2" "quack-kernels==0.3.10"
+> ```
 
 ## Running Tests
 
@@ -118,6 +126,40 @@ Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-b
 Kernels are JIT-compiled. Cache key includes dtype, head_dim, causal, mask/score_mod hashes, architecture, block sizes. Caching levels: in-memory LRU + optional disk cache via `get_jit_cache()`.
 
 Env vars: `CUTE_CUBIN_PATH` (dump CUBIN/SASS), `CUTE_DSL_KEEP_PTX=1` (inspect PTX), `CUTE_DSL_PTXAS_PATH` (custom ptxas).
+
+## head_dim=512 (Gemma 4)
+
+Symmetric `head_dim=512` (q=k=v=512) is enabled on **SM90 only** (Hopper). Gemma 4's global
+layers use it (GQA 8/4, causal, bf16); local/sliding layers use `head_dim=256` (unchanged).
+Use the normal entry points — `flash_attn_func` / `flash_attn_varlen_func` route automatically.
+
+Why 512 is hard on SM90: WGMMA N-mode caps at 256, the `O[tile_m, 512]` fp32 accumulator is
+huge, and a `[128, 512]` bf16 tile alone is 128KB of the 227KB smem budget.
+
+**Forward — fused, fast** (`flash_fwd_sm90.py`, `interface.py`):
+- `_validate_head_dims`: SM90 allows `8..256` **or exactly 512** (288/384/etc. still rejected).
+- `_tile_size_fwd_sm90`: hdim-512 → `FwdConfig(tile_m=64, tile_n=80)`, `num_stages=1` (smem-bound).
+- `_get_tiled_mma`: when `tile_hdimv > 256`, `pv_n_split=2` → PV MMA `atom_layout=(tile_m//64, 2, 1)`,
+  atom N=256. Technique = **redundant-QK 2-warpgroup N-split**: `num_mma_threads=max(qk,pv)`, the
+  QK gemm is replicated across both warpgroups (`tidx % qk_size`) so each redundantly computes the
+  full `QK^T`/softmax and owns one 256-wide half of O → O accumulator drops 256→128 regs/thread.
+- Result on H100: ~374 TFLOPS at d=512 (vs ~52 spilling before the N-split); ~658 TFLOPS at d=256 (unchanged).
+
+**Backward — correct, memory-efficient (not yet a fused kernel)** (`interface.py`):
+- The fused SM90 bwd cannot fit head_dim=512 in smem (four `[64,512]` tiles = 256KB **alone**
+  exceed 227KB, before the `[64,512]` fp32 `sdQaccum`), so a fused bwd needs head-dim chunking
+  (a large rewrite of `flash_bwd_sm90.py`'s 5-gemm core — **TODO / perf follow-up**).
+- For now `FlashAttnFunc.backward` routes `head_dim > 256` to `_flash_attn_bwd_large_headdim`: an
+  exact recompute backward, blocked over the query dim (never materialises the full `s_q×s_k`
+  scores), bf16 tensor-core matmuls + fp32 softmax/accumulate, with causal block-skipping.
+  ~67–83 TFLOPS at d=512 on H100. No softcap/sink/score_mod/mask_mod (Gemma 4 needs none).
+- Adequate for training since global (512) layers are only ~1/6 of Gemma 4; the fast kernels run everywhere else.
+
+**Testing / dev** (cannot run on local Ampere — needs SM90):
+- `dev512/check.py` (correctness vs torch ref), `dev512/bench.py` (TFLOPS), `dev512/test_hdim512.py`
+  (pytest, 36 cases). Run from `dev512/` so the installed `flash-attn-4` cute package shadows the
+  FA2-importing top-level `flash_attn` package: `cd dev512 && pytest test_hdim512.py -q`.
+- This was developed on a RunPod H100 (`RUNPOD_API_KEY` in `.env`); see `AI/HDIM512.md`.
 
 ## Key Patterns
 
