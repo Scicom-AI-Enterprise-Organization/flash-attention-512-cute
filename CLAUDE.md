@@ -8,6 +8,8 @@ FlashAttention-4 (FA4) — fast, memory-efficient exact attention kernels writte
 
 The repository also contains older generations (FA2 in top-level `csrc/`, FA3 in `hopper/`) but active development is on FA4 in `flash_attn/cute/`.
 
+**This fork adds symmetric `head_dim=512` support on Hopper (SM90)** for Gemma 4's global-attention layers (Gemma 4 uses `head_dim=256` for sliding layers and `global_head_dim=512` for the ~1/6 global layers; GQA, causal). See the "head_dim=512 (Gemma 4)" section below.
+
 ## Agent Scratch Space
 
 Use `agent_space/` for project-local scratch work such as lab notes, profiling outputs, temporary repro scripts, and experiment artifacts. Treat it as disposable workspace rather than product code.
@@ -21,6 +23,12 @@ pip install -e "flash_attn/cute[dev]"
 ```
 
 Dependencies: `nvidia-cutlass-dsl>=4.4.1`, `torch`, `einops`, `apache-tvm-ffi`, `quack-kernels>=0.2.10`.
+
+> **Version pin (important):** the `>=` bounds let `pip` pull *too-new* deps that break with API skew (quack 0.5.0 dropped the `arch` arg in `get_smem_store_C`; cutlass-dsl 4.5.x renamed `cutlass.base_dsl.Arch`). The combo that works with this tree (HEAD ~2026-04) on H100 / torch 2.8 / py3.12 is:
+> ```bash
+> pip install -e "flash_attn/cute[dev]"
+> pip install "nvidia-cutlass-dsl==4.4.2" "quack-kernels==0.3.10"
+> ```
 
 ## Running Tests
 
@@ -118,6 +126,72 @@ Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-b
 Kernels are JIT-compiled. Cache key includes dtype, head_dim, causal, mask/score_mod hashes, architecture, block sizes. Caching levels: in-memory LRU + optional disk cache via `get_jit_cache()`.
 
 Env vars: `CUTE_CUBIN_PATH` (dump CUBIN/SASS), `CUTE_DSL_KEEP_PTX=1` (inspect PTX), `CUTE_DSL_PTXAS_PATH` (custom ptxas).
+
+## head_dim=512 (Gemma 4)
+
+Symmetric `head_dim=512` (q=k=v=512) is enabled on **SM90 only** (Hopper). Gemma 4's global
+layers use it (GQA 8/4, causal, bf16); local/sliding layers use `head_dim=256` (unchanged).
+Use the normal entry points — `flash_attn_func` / `flash_attn_varlen_func` route automatically.
+
+Why 512 is hard on SM90: WGMMA N-mode caps at 256, the `O[tile_m, 512]` fp32 accumulator is
+huge, and a `[128, 512]` bf16 tile alone is 128KB of the 227KB smem budget.
+
+**Forward — fused, fast** (`flash_fwd_sm90.py`, `interface.py`):
+- `_validate_head_dims`: SM90 allows `8..256` **or exactly 512** (288/384/etc. still rejected).
+- `_tile_size_fwd_sm90`: hdim-512 → `FwdConfig(tile_m=64, tile_n=80)`, `num_stages=1` (smem-bound).
+- `_get_tiled_mma`: when `tile_hdimv > 256`, `pv_n_split=2` → PV MMA `atom_layout=(tile_m//64, 2, 1)`,
+  atom N=256. Technique = **redundant-QK 2-warpgroup N-split**: `num_mma_threads=max(qk,pv)`, the
+  QK gemm is replicated across both warpgroups (`tidx % qk_size`) so each redundantly computes the
+  full `QK^T`/softmax and owns one 256-wide half of O → O accumulator drops 256→128 regs/thread.
+- Result on H100: ~374 TFLOPS at d=512 (vs ~52 spilling before the N-split); ~658 TFLOPS at d=256 (unchanged).
+
+**Backward — correct, memory-efficient (not yet a fused kernel)** (`interface.py`):
+- The fused SM90 bwd cannot fit head_dim=512 in smem (four `[64,512]` tiles = 256KB **alone**
+  exceed 227KB, before the `[64,512]` fp32 `sdQaccum`), so a fused bwd needs head-dim chunking
+  (a large rewrite of `flash_bwd_sm90.py`'s 5-gemm core — **TODO / perf follow-up**).
+- For now both `FlashAttnFunc.backward` **and `FlashAttnVarlenFunc.backward`** route
+  `head_dim > 256` to `_flash_attn_bwd_large_headdim`: an exact recompute backward, blocked
+  over the query dim (never materialises the full `s_q×s_k` scores), bf16 tensor-core matmuls
+  + fp32 softmax/accumulate, with causal block-skipping. Varlen (packed) uses a per-document
+  block-causal mask built from cu_seqlens — i.e. Gemma 4's packed training is covered.
+  ~67–83 TFLOPS at d=512 on H100. No softcap/sink/score_mod/mask_mod (Gemma 4 needs none).
+- **Validated end-to-end on the real `google/gemma-4-31B-it`**: FA-512 (all attention layers
+  routed through this repo's varlen kernel) vs the default attention give matching logits —
+  argmax + top-5 identical, cosine 0.99914 (bf16 noise). See `dev512/compare_logits_fa4.py`.
+- Adequate for training since global (512) layers are only ~1/6 of Gemma 4; the fast kernels run everywhere else.
+
+**Memory & speed vs the SDPA-512 fallback.** Gemma 4's `head_dim=512` full-attention
+layers currently fall back to query-tiled SDPA + activation checkpointing
+(`GPUPlatform/autotrain/gemma4/attention.py::_packed_sdpa_full`, since FA3 caps at 256).
+FA-512 (fused fwd + recompute bwd) vs that fallback — combined forward+backward, B=1,
+H=8/Hkv=4, D=512, bf16, causal, single H100 80GB (outputs/grads match within bf16 tol):
+
+| seqlen | FA-512 mem / fwd+bwd | SDPA-tiled mem / fwd+bwd | naive SDPA |
+|-------:|---------------------:|-------------------------:|-----------:|
+|   4096 |   1.4 GB /     6 ms  |    1.6 GB /    28 ms     | 2.8 GB / 20 ms |
+|   8192 |   2.7 GB /    18 ms  |    3.2 GB /   108 ms     | 9.7 GB / 79 ms |
+|  16384 |   5.4 GB /    64 ms  |    6.4 GB /   420 ms     | 36.6 GB / 314 ms |
+|  32768 |  10.2 GB /   241 ms  |   13.2 GB /  1692 ms     | OOM |
+|  65536 |  21.7 GB /   952 ms  |   28.4 GB /  6747 ms     | OOM |
+| 131072 |  41.0 GB /  3769 ms  |   65.3 GB / 26881 ms     | OOM |
+
+→ **~5–7× faster fwd+bwd** (~20–90× forward-only), **~25–40% less memory** than the tiled
+SDPA fallback, and it avoids the naive-SDPA O(H·S²) OOM entirely — 128k context fits on one
+80GB H100 (~41 GB), leaving room for ~192k. The non-fused recompute backward is the current
+bottleneck (a fused chunked bwd kernel would widen the gap further). The packed-varlen case
+(Gemma 4's actual training; per-document block-causal) shows the same ~7× speedup / lower
+memory — e.g. 65536 packed tokens (doc_len 2048): FA-512 20.8 GB / 869 ms vs SDPA-tiled
+27.4 GB / 6714 ms. Reproduce: `cd dev512 && python compare_attn.py` (dense) and
+`python compare_attn_varlen.py` (packed) — both copy `gemma4_dynamic_attention.py` from the autotrain repo.
+
+**Testing / dev** (cannot run on local Ampere — needs SM90). All in `dev512/`:
+- `check.py` / `check_varlen.py` — dense / packed-varlen fwd+bwd correctness vs torch ref.
+- `test_hdim512.py` — pytest, 36 cases (run from `dev512/` so the installed `flash-attn-4`
+  cute package shadows the FA2-importing top-level `flash_attn`: `cd dev512 && pytest test_hdim512.py -q`).
+- `bench.py` — TFLOPS; `compare_attn.py` / `compare_attn_varlen.py` — vs SDPA-512 fallback.
+- `compare_logits_fa4.py` + `gemma4_fa4_attention.py` — real-Gemma-4 logits match vs default attn
+  (needs `HF_TOKEN`, ~62 GB model, 80 GB H100).
+- This was developed on a RunPod H100 (`RUNPOD_API_KEY`, `HF_TOKEN` in `.env`); see `AI/HDIM512.md`.
 
 ## Key Patterns
 
