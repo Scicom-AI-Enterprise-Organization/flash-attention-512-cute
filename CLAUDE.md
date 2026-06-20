@@ -155,6 +155,27 @@ huge, and a `[128, 512]` bf16 tile alone is 128KB of the 227KB smem budget.
   ~67–83 TFLOPS at d=512 on H100. No softcap/sink/score_mod/mask_mod (Gemma 4 needs none).
 - Adequate for training since global (512) layers are only ~1/6 of Gemma 4; the fast kernels run everywhere else.
 
+**Memory & speed vs the SDPA-512 fallback.** Gemma 4's `head_dim=512` full-attention
+layers currently fall back to query-tiled SDPA + activation checkpointing
+(`GPUPlatform/autotrain/gemma4/attention.py::_packed_sdpa_full`, since FA3 caps at 256).
+FA-512 (fused fwd + recompute bwd) vs that fallback — combined forward+backward, B=1,
+H=8/Hkv=4, D=512, bf16, causal, single H100 80GB (outputs/grads match within bf16 tol):
+
+| seqlen | FA-512 mem / fwd+bwd | SDPA-tiled mem / fwd+bwd | naive SDPA |
+|-------:|---------------------:|-------------------------:|-----------:|
+|   4096 |   1.4 GB /     6 ms  |    1.6 GB /    28 ms     | 2.8 GB / 20 ms |
+|   8192 |   2.7 GB /    18 ms  |    3.2 GB /   108 ms     | 9.7 GB / 79 ms |
+|  16384 |   5.4 GB /    64 ms  |    6.4 GB /   420 ms     | 36.6 GB / 314 ms |
+|  32768 |  10.2 GB /   241 ms  |   13.2 GB /  1692 ms     | OOM |
+|  65536 |  21.7 GB /   952 ms  |   28.4 GB /  6747 ms     | OOM |
+| 131072 |  41.0 GB /  3769 ms  |   65.3 GB / 26881 ms     | OOM |
+
+→ **~5–7× faster fwd+bwd** (~20–90× forward-only), **~25–40% less memory** than the tiled
+SDPA fallback, and it avoids the naive-SDPA O(H·S²) OOM entirely — 128k context fits on one
+80GB H100 (~41 GB), leaving room for ~192k. The non-fused recompute backward is the current
+bottleneck (a fused chunked bwd kernel would widen the gap further). Reproduce:
+`cd dev512 && python compare_attn.py` (copies `gemma4_dynamic_attention.py` from the autotrain repo).
+
 **Testing / dev** (cannot run on local Ampere — needs SM90):
 - `dev512/check.py` (correctness vs torch ref), `dev512/bench.py` (TFLOPS), `dev512/test_hdim512.py`
   (pytest, 36 cases). Run from `dev512/` so the installed `flash-attn-4` cute package shadows the

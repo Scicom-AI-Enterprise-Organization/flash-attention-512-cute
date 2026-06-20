@@ -80,6 +80,28 @@ To make the bwd a fused kernel, head-dim chunk `flash_bwd_sm90.py` by factor 2 (
 This touches `load()`, `mma()` (5 fragment sets), `mma_one_m_block()`, smem layout, the dQ TMA-reduce
 and `epilogue_dKV` — large and pipeline-sensitive.
 
+## Benchmark vs the SDPA-512 fallback (the thing this replaces)
+
+Gemma 4's head_dim=512 full-attention currently uses query-tiled SDPA + activation
+checkpointing (`GPUPlatform/autotrain/gemma4/attention.py::_packed_sdpa_full`).
+`dev512/compare_attn.py` benchmarks FA-512 (fused fwd + recompute bwd) against it,
+combined fwd+bwd, B=1 H=8 Hkv=4 D=512 bf16 causal on one H100 80GB (outputs/grads match
+within bf16 tol):
+
+| seqlen | FA-512 mem / fwd+bwd | SDPA-tiled mem / fwd+bwd | naive SDPA |
+|-------:|---------------------:|-------------------------:|-----------:|
+|   4096 |  1.4 GB /     6 ms   |   1.6 GB /    28 ms      | 2.8 GB / 20 ms |
+|   8192 |  2.7 GB /    18 ms   |   3.2 GB /   108 ms      | 9.7 GB / 79 ms |
+|  16384 |  5.4 GB /    64 ms   |   6.4 GB /   420 ms      | 36.6 GB / 314 ms |
+|  32768 | 10.2 GB /   241 ms   |  13.2 GB /  1692 ms      | OOM |
+|  65536 | 21.7 GB /   952 ms   |  28.4 GB /  6747 ms      | OOM |
+| 131072 | 41.0 GB /  3769 ms   |  65.3 GB / 26881 ms      | OOM |
+
+~5–7× faster fwd+bwd (~20–90× fwd-only), ~25–40% less memory, no O(H·S²) OOM. 128k context
+fits on one 80GB H100 (~41 GB). The recompute bwd is the bottleneck — a fused chunked bwd
+kernel (above) would widen the gap. `gemma4_dynamic_attention.py` is copied from the
+autotrain repo so the comparison is self-contained.
+
 ## Verification
 
 - `dev512/check.py` — fwd/bwd vs fp32 torch reference (args: `--d --dv --causal --hq --hkv --sq --sk --dtype --bwd`).
