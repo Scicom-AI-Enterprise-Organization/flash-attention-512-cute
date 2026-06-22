@@ -1082,6 +1082,45 @@ def _bwd_postprocess_convert(
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
 
 
+def _bwd_large_headdim_block(qb, kf_b, vf_b, dob, delta_b, scale, mask):
+    """One query-block of the head_dim>256 recompute backward.
+
+    All five matmuls plus the softmax/dS elementwise chain for a single
+    [bm, kmax] score tile. Compiled with torch.compile so inductor fuses the
+    softmax + cast + dS pointwise ops into the matmul epilogues — the eager
+    version is memory-bound (~50% of its time is fp32 materialisation / casts).
+
+    qb (b,h,bm,d), kf_b (b,h,kmax,d), vf_b (b,h,kmax,dv), dob (b,h,bm,dv),
+    delta_b (b,h,bm,1). Returns dq_b (bf16, written once per block) and dk_c/dv_c
+    (fp32, accumulated across blocks — the cast is fused into the matmul epilogue).
+    """
+    s = torch.matmul(qb, kf_b.transpose(-1, -2)).float() * scale   # (b,h,bm,kmax)
+    if mask is not None:
+        s = s.masked_fill(mask, float("-inf"))
+    p = torch.softmax(s, dim=-1)
+    p_cast = p.to(qb.dtype)
+    dp = torch.matmul(dob, vf_b.transpose(-1, -2)).float()
+    ds = (p * (dp - delta_b) * scale).to(qb.dtype)
+    dv_c = torch.matmul(p_cast.transpose(-1, -2), dob).float()      # (b,h,kmax,dv)
+    dq_b = torch.matmul(ds, kf_b)                                   # (b,h,bm,d) bf16
+    dk_c = torch.matmul(ds.transpose(-1, -2), qb).float()          # (b,h,kmax,d)
+    return dq_b, dk_c, dv_c
+
+
+# OPT-IN acceleration. torch.compile fuses the memory-bound softmax/cast chain (it dominates
+# this path) for ~2-2.5x over eager. dynamic=True is *meant* to keep one graph across varying
+# seqlens, but it is OFF BY DEFAULT because varlen training feeds a different total-token count
+# every step: if dynamic-shape inference ever degrades to per-shape recompilation it blows past
+# torch._dynamo's cache_size_limit (8) and silently falls back to eager forever. Enable with
+# FLASH_ATTENTION_LARGE_HEADDIM_COMPILE=1 only when seqlens are stable (e.g. fixed-length / dense)
+# or after verifying recompiles stay bounded for your shape distribution (dev512/test_varlen_recompile.py).
+_bwd_large_headdim_block_compiled = torch.compile(_bwd_large_headdim_block, dynamic=True)
+
+
+def _large_headdim_compile_enabled():
+    return os.environ.get("FLASH_ATTENTION_LARGE_HEADDIM_COMPILE", "0") == "1"
+
+
 def _flash_attn_bwd_large_headdim(
     q: torch.Tensor,        # (b, sq, hq, d)
     k: torch.Tensor,        # (b, sk, hkv, d)
@@ -1094,7 +1133,7 @@ def _flash_attn_bwd_large_headdim(
     window_size_right: Optional[int] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
-    q_block: int = 1024,
+    q_block: Optional[int] = None,
 ):
     """Memory-efficient exact backward for head_dim that the SM90 fused bwd kernel
     cannot fit in shared memory (head_dim > 256, e.g. Gemma 4 global layers,
@@ -1149,10 +1188,20 @@ def _flash_attn_bwd_large_headdim(
     # delta_i = sum_j dO_ij * O_ij  (over dv)
     delta = (dob_all.float() * of).sum(-1)  # (b, hq, sq)
 
-    dq = torch.zeros((b, hq, sq, d), dtype=torch.float32, device=dev)
+    # dQ is written once per query-block (no cross-block accumulation) so it can
+    # stay in the input dtype; dK/dV accumulate across query-blocks so they stay fp32.
+    dq = torch.empty((b, hq, sq, d), dtype=in_dtype, device=dev)
     dk_e = torch.zeros((b, hq, sk, d), dtype=torch.float32, device=dev)
     dv_e = torch.zeros((b, hq, sk, dv), dtype=torch.float32, device=dev)
 
+    # Default = eager (no torch.compile) so varlen training, which feeds a different total-token
+    # count every step, never risks a recompile storm. Opt in with the env var for the ~2-2.5x
+    # fused speedup; the bigger q_block only pays off once the body is compiled (it amortises the
+    # cross-block fp32 dK/dV accumulation), so eager keeps the original memory-safe 1024.
+    use_compile = _large_headdim_compile_enabled()
+    block_fn = _bwd_large_headdim_block_compiled if use_compile else _bwd_large_headdim_block
+    if q_block is None:
+        q_block = 2048 if use_compile else 1024
     # bottom-right alignment offset (query i sees key i + offset)
     offset = sk - sq
     masked = causal or window_size_left is not None or window_size_right is not None or is_varlen
@@ -1168,7 +1217,7 @@ def _flash_attn_bwd_large_headdim(
         deltab = delta[:, :, q0:q1].unsqueeze(-1)  # (b, hq, bm, 1)
         kf_b = kf_e[:, :, :kmax]
         vf_b = vf_e[:, :, :kmax]
-        s = torch.matmul(qb, kf_b.transpose(-1, -2)).float() * softmax_scale  # (b, hq, bm, kmax)
+        mask = None
         if masked:
             i_idx = torch.arange(q0, q1, device=dev).view(-1, 1) + offset  # (bm,1)
             j_idx = j_full[:, :kmax]
@@ -1183,17 +1232,12 @@ def _flash_attn_bwd_large_headdim(
                 mask |= j_idx < i_idx - window_size_left
             if is_varlen:  # drop cross-document keys (per-document block-causal)
                 mask |= doc_q[q0:q1].view(-1, 1) != doc_k[:kmax].view(1, -1)
-            s = s.masked_fill(mask.view(1, 1, q1 - q0, kmax), float("-inf"))
-        p = torch.softmax(s, dim=-1)             # (b, hq, bm, kmax) fp32
-        p_cast = p.to(in_dtype)
-        # dV += P^T @ dO
-        dv_e[:, :, :kmax] += torch.matmul(p_cast.transpose(-1, -2), dob).float()
-        # dP = dO @ V^T ; dS = P * (dP - delta) * scale
-        dp = torch.matmul(dob, vf_b.transpose(-1, -2)).float()   # (b, hq, bm, kmax)
-        ds = (p * (dp - deltab) * softmax_scale).to(in_dtype)
-        # dQ = dS @ K ; dK += dS^T @ Q
-        dq[:, :, q0:q1] = torch.matmul(ds, kf_b).float()
-        dk_e[:, :, :kmax] += torch.matmul(ds.transpose(-1, -2), qb).float()
+            mask = mask.view(1, 1, q1 - q0, kmax)
+        # Fused per-block: S=QK^T, softmax, dS, then dV+=P^T@dO, dQ=dS@K, dK+=dS^T@Q.
+        dq_b, dk_c, dv_c = block_fn(qb, kf_b, vf_b, dob, deltab, softmax_scale, mask)
+        dq[:, :, q0:q1] = dq_b
+        dv_e[:, :, :kmax] += dv_c
+        dk_e[:, :, :kmax] += dk_c
 
     # Reduce expanded kv-head grads back to hkv heads.
     if g != 1:

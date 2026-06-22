@@ -145,16 +145,30 @@ huge, and a `[128, 512]` bf16 tile alone is 128KB of the 227KB smem budget.
   full `QK^T`/softmax and owns one 256-wide half of O → O accumulator drops 256→128 regs/thread.
 - Result on H100: ~374 TFLOPS at d=512 (vs ~52 spilling before the N-split); ~658 TFLOPS at d=256 (unchanged).
 
-**Backward — correct, memory-efficient (not yet a fused kernel)** (`interface.py`):
+**Backward — recompute path, torch.compile-fused** (`interface.py`):
 - The fused SM90 bwd cannot fit head_dim=512 in smem (four `[64,512]` tiles = 256KB **alone**
-  exceed 227KB, before the `[64,512]` fp32 `sdQaccum`), so a fused bwd needs head-dim chunking
-  (a large rewrite of `flash_bwd_sm90.py`'s 5-gemm core — **TODO / perf follow-up**).
-- For now both `FlashAttnFunc.backward` **and `FlashAttnVarlenFunc.backward`** route
-  `head_dim > 256` to `_flash_attn_bwd_large_headdim`: an exact recompute backward, blocked
-  over the query dim (never materialises the full `s_q×s_k` scores), bf16 tensor-core matmuls
-  + fp32 softmax/accumulate, with causal block-skipping. Varlen (packed) uses a per-document
-  block-causal mask built from cu_seqlens — i.e. Gemma 4's packed training is covered.
-  ~67–83 TFLOPS at d=512 on H100. No softcap/sink/score_mod/mask_mod (Gemma 4 needs none).
+  exceed 227KB, before the `[64,512]` fp32 `sdQaccum`), so a true fused bwd would need head-dim
+  chunking (a large rewrite of `flash_bwd_sm90.py`'s 5-gemm core — see follow-up note below).
+- Both `FlashAttnFunc.backward` **and `FlashAttnVarlenFunc.backward`** route `head_dim > 256` to
+  `_flash_attn_bwd_large_headdim`: an exact recompute backward, blocked over the query dim
+  (`q_block=2048`, never materialises the full `s_q×s_k` scores), with causal block-skipping.
+  Varlen (packed) uses a per-document block-causal mask from cu_seqlens — Gemma 4's packed
+  training is covered. No softcap/sink/score_mod/mask_mod (Gemma 4 needs none).
+- **This path is memory-bound, not compute-bound**: eager PyTorch spends ~75% of its time on fp32
+  materialisation + dtype casts of the `[bm, kmax]` score tiles and only ~17% in the 5 matmuls.
+  The per-block body (`_bwd_large_headdim_block`: `S=QK^T`, softmax, dS, then `dV+=Pᵀ@dO`,
+  `dQ=dS@K`, `dK+=dSᵀ@Q`) can be run through **`torch.compile`** so inductor fuses the softmax/cast/dS
+  pointwise chain into the matmul epilogues — combined with **dQ in bf16** (written once per block,
+  no fp32 accumulator) and `q_block=2048`, this is **~2.0–2.5× over eager with *lower* peak memory**
+  (s=4k→16k+: ~136→243 TFLOPS; at s≥16k it matches the d=256 fused bwd ~241). Bit-identical math to
+  eager (verified grad-for-grad); all 36 `dev512` tests pass.
+- **torch.compile is OPT-IN, OFF by default** — set `FLASH_ATTENTION_LARGE_HEADDIM_COMPILE=1`.
+  Why off by default: varlen *training* feeds a different total-token count every step, and if
+  `torch.compile`'s `dynamic=True` shape inference ever degrades to per-shape recompilation it blows
+  past `torch._dynamo`'s `cache_size_limit` (8) and silently falls back to eager forever. Safe to
+  enable for stable/fixed seqlens, or after checking recompiles stay bounded for your shape mix
+  (`dev512/test_varlen_recompile.py`). The default eager path is the original ~67–95 TFLOPS bwd
+  (plus the free dQ-in-bf16 memory trim) and carries no recompilation risk.
 - **Validated end-to-end on the real `google/gemma-4-31B-it`**: FA-512 (all attention layers
   routed through this repo's varlen kernel) vs the default attention give matching logits —
   argmax + top-5 identical, cosine 0.99914 (bf16 noise). See `dev512/compare_logits_fa4.py`.
@@ -163,38 +177,44 @@ huge, and a `[128, 512]` bf16 tile alone is 128KB of the 227KB smem budget.
 **Memory & speed vs the SDPA-512 fallback.** Gemma 4's `head_dim=512` full-attention
 layers currently fall back to query-tiled SDPA + activation checkpointing
 (`GPUPlatform/autotrain/gemma4/attention.py::_packed_sdpa_full`, since FA3 caps at 256).
-FA-512 (fused fwd + recompute bwd) vs that fallback — combined forward+backward, B=1,
-H=8/Hkv=4, D=512, bf16, causal, single H100 80GB (outputs/grads match within bf16 tol):
+FA-512 (fused fwd + recompute bwd, **`FLASH_ATTENTION_LARGE_HEADDIM_COMPILE=1`**) vs that fallback —
+combined forward+backward, B=1, H=8/Hkv=4, D=512, bf16, causal, single H100 80GB (outputs/grads
+match within bf16 tol). Without the compile opt-in the bwd is ~2–2.5× slower (default, training-safe):
 
 | seqlen | FA-512 mem / fwd+bwd | SDPA-tiled mem / fwd+bwd | naive SDPA |
 |-------:|---------------------:|-------------------------:|-----------:|
-|   4096 |   1.4 GB /     6 ms  |    1.6 GB /    28 ms     | 2.8 GB / 20 ms |
-|   8192 |   2.7 GB /    18 ms  |    3.2 GB /   108 ms     | 9.7 GB / 79 ms |
-|  16384 |   5.4 GB /    64 ms  |    6.4 GB /   420 ms     | 36.6 GB / 314 ms |
-|  32768 |  10.2 GB /   241 ms  |   13.2 GB /  1692 ms     | OOM |
-|  65536 |  21.7 GB /   952 ms  |   28.4 GB /  6747 ms     | OOM |
-| 131072 |  41.0 GB /  3769 ms  |   65.3 GB / 26881 ms     | OOM |
+|   4096 |   1.0 GB /     3 ms  |    1.6 GB /    28 ms     | 2.8 GB / 20 ms |
+|   8192 |   2.1 GB /     8 ms  |    3.2 GB /   109 ms     | 9.7 GB / 79 ms |
+|  16384 |   4.2 GB /    28 ms  |    6.4 GB /   419 ms     | 36.6 GB / 314 ms |
+|  32768 |   8.3 GB /   103 ms  |   13.2 GB /  1692 ms     | OOM |
+|  65536 |  16.5 GB /   400 ms  |   28.4 GB /  6747 ms     | OOM |
+| 131072 |  33.1 GB /  1560 ms  |   65.3 GB / 26881 ms     | OOM |
 
-→ **~5–7× faster fwd+bwd** (~20–90× forward-only), **~25–40% less memory** than the tiled
+→ **~10–17× faster fwd+bwd** (~22× forward-only), **~35–50% less memory** than the tiled
 SDPA fallback, and it avoids the naive-SDPA O(H·S²) OOM entirely — 128k context fits on one
-80GB H100 (~41 GB), leaving room for ~192k. The non-fused recompute backward is the current
-bottleneck (a fused chunked bwd kernel would widen the gap further).
+80GB H100 (~33 GB), leaving room for ~256k. (Was ~5–7× / ~25–40% before the torch.compile
+backward; the recompute bwd is no longer the dominant cost — see the backward note above.)
 
 **Packed varlen** — this is what Gemma 4 training actually does: documents packed to `total`
 tokens with per-document block-causal attention (cu_seqlens). FA-512 via
 `flash_attn_varlen_func` vs the SDPA-512 fallback (`_packed_sdpa_full`, same cu_seqlens),
-fwd+bwd, doc_len=2048, H=8/Hkv=4, D=512, bf16, H100 80GB (outputs match within bf16 tol):
+fwd+bwd, doc_len=2048, H=8/Hkv=4, D=512, bf16, H100 80GB (outputs match within bf16 tol).
+Note: FA-512 numbers below are with `FLASH_ATTENTION_LARGE_HEADDIM_COMPILE=1`; since training
+shapes vary per step, only enable it after `dev512/test_varlen_recompile.py` confirms recompiles
+stay bounded (else the default eager bwd is ~2–2.5× slower but recompile-free):
 
 | total tokens | FA-512 mem / fwd+bwd | SDPA-tiled mem / fwd+bwd | speedup |
 |-------------:|---------------------:|-------------------------:|--------:|
-|         8192 |   2.6 GB /    17 ms  |    3.0 GB /   108 ms     |  ~6.2×  |
-|        16384 |   5.2 GB /    60 ms  |    6.1 GB /   421 ms     |  ~7.1×  |
-|        32768 |  10.4 GB /   222 ms  |   12.7 GB /  1694 ms     |  ~7.6×  |
-|        65536 |  20.8 GB /   869 ms  |   27.4 GB /  6714 ms     |  ~7.7×  |
+|         8192 |   2.0 GB /     8 ms  |    3.0 GB /   110 ms     |  ~14×   |
+|        16384 |   4.0 GB /    24 ms  |    6.1 GB /   419 ms     |  ~18×   |
+|        32768 |   8.0 GB /    82 ms  |   12.7 GB /  1693 ms     |  ~21×   |
+|        65536 |  16.0 GB /   305 ms  |   27.4 GB /  6752 ms     |  ~22×   |
 
-Same ~7× fwd+bwd speedup and ~25% lower memory as the dense case — the packing (block-diagonal
-mask) doesn't change the win. Reproduce: `cd dev512 && python compare_attn.py` (dense) and
-`python compare_attn_varlen.py` (packed) — both copy `gemma4_dynamic_attention.py` from the autotrain repo.
+~14–22× fwd+bwd speedup and ~35–42% lower memory (was ~6–8× / ~25% with the eager bwd) — the
+packing (block-diagonal mask) doesn't change the win. Reproduce (compile opt-in for these numbers):
+`cd dev512 && FLASH_ATTENTION_LARGE_HEADDIM_COMPILE=1 python compare_attn.py` (dense) and
+`… python compare_attn_varlen.py` (packed) — both copy `gemma4_dynamic_attention.py` from the
+autotrain repo.
 
 **Testing / dev** (cannot run on local Ampere — needs SM90). All in `dev512/`:
 - `check.py` / `check_varlen.py` — dense / packed-varlen fwd+bwd correctness vs torch ref.
@@ -204,6 +224,35 @@ mask) doesn't change the win. Reproduce: `cd dev512 && python compare_attn.py` (
 - `compare_logits_fa4.py` + `gemma4_fa4_attention.py` — real-Gemma-4 logits match vs default attn
   (needs `HF_TOKEN`, ~62 GB model, 80 GB H100).
 - This was developed on a RunPod H100 (`RUNPOD_API_KEY`, `HF_TOKEN` in `.env`); see `AI/HDIM512.md`.
+
+### RunPod H100 access (how to get an SM90 GPU)
+
+Local dev boxes are Ampere (RTX 3090/3090 Ti) and **cannot run FA4** — SM90 work runs on a RunPod
+H100. `runpodctl` is installed and authed (`~/.runpod/config.toml` holds the API key, mirrored as
+`RUNPOD_API_KEY` in `.env`). The SSH key that actually works on these pods is **`~/.ssh/id_rsa`**
+(not the `~/.runpod/ssh/runpodctl-ssh-key`).
+
+```bash
+# List pods (note: 'get pod' is deprecated → use 'pod list'). Check util before reusing a pod —
+# others may be training on it (e.g. an existing 'neucodec-44k' H100 runs at 100%).
+runpodctl pod list
+runpodctl get pod <id> --allfields          # shows the 'IP:PORT->22 (pub,tcp)' SSH endpoint
+
+# Deploy a fresh H100 SXM (secure cloud, SSH on). Don't reuse a busy pod.
+runpodctl create pod --name fa512-perf \
+  --gpuType "NVIDIA H100 80GB HBM3" --gpuCount 1 \
+  --imageName "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404" \
+  --containerDiskSize 120 --volumeSize 0 --secureCloud --startSSH --ports "22/tcp"
+
+# SSH in (poll 'get pod ... --allfields' for the pub,tcp endpoint first):
+ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -p <PORT> root@<IP>
+
+# Tear down when done (billed per hour, H100 SXM ≈ $3.29/hr):
+runpodctl remove pod <id>
+```
+
+GPU type IDs come from the GraphQL `gpuTypes` query; H100 SXM is `"NVIDIA H100 80GB HBM3"`.
+Per-pod setup (clone, dep pins) is in `AI/HDIM512.md`.
 
 ## Key Patterns
 

@@ -62,15 +62,38 @@ Current solution (`interface.py`): both `FlashAttnFunc.backward` and
 `FlashAttnVarlenFunc.backward` route `head_dim > 256` to `_flash_attn_bwd_large_headdim`
 — an exact recompute backward (varlen builds a per-document block-causal mask from
 cu_seqlens, so Gemma 4's packed training is covered):
-- Blocks over the query dim (`q_block=1024`), so the `s_q×s_k` scores are never fully materialised.
+- Blocks over the query dim (`q_block=2048`), so the `s_q×s_k` scores are never fully materialised.
 - bf16 tensor-core matmuls (fp32 accumulation, matching the kernel) + fp32 softmax & cross-block
   gradient accumulation. Causal block-skipping (only keys up to the diagonal).
 - Handles causal / sliding-window / GQA / fp16 / bf16. Asserts no softcap/return_lse-grad
   (Gemma 4 attention uses neither; sink/score_mod/mask_mod also unsupported on this path).
-- ~67–83 TFLOPS at d=512 on H100 (vs ~241 for the d=256 fused bwd) — ~3–4× off a fused kernel,
-  but global (512) layers are only ~1/6 of Gemma 4, so end-to-end training impact is small.
 
-### Fused chunked backward — plan (perf follow-up)
+**torch.compile optimisation (2026-06, this fork — OPT-IN).** Profiling showed the recompute bwd is
+**memory-bound, not compute-bound**: in eager PyTorch ~53% of the time is `.float()`/`.to(bf16)`
+casts and ~21% is the softmax/dS elementwise ops, while the 5 matmuls are only ~17%. So instead of
+a custom fused kernel, the per-block body (`_bwd_large_headdim_block`) can be run through
+`torch.compile(dynamic=True)` — inductor fuses the softmax + cast + dS pointwise chain into the
+matmul epilogues. Plus two cheap wins: **dQ stays bf16** (written once per query block, so no fp32
+accumulator + cast — kept in the eager path too) and **q_block 1024→2048** (halves the cross-block
+fp32 dK/dV accumulation passes; compile-path only). Net: **~2.0–2.5× faster AND lower peak memory**
+(fewer live fp32 intermediates), e.g. `bench.py` bwd at b2/hq8/causal: s=4096 67→136, s=8192 83→194,
+s=16384 95→243 TFLOPS — at s≥16k it matches the d=256 fused bwd (~241). Bit-identical math to the
+eager path (verified: eager vs compiled give the same grads to the last digit at a fixed seed); all
+36 `dev512` tests pass. q_block=2048 was the sweet spot: q_block=4096 is only ~4% faster but ~50%
+more memory (would break the 128k-fits-in-80GB story).
+
+**Why it's OFF by default** (`FLASH_ATTENTION_LARGE_HEADDIM_COMPILE=1` to enable). varlen *training*
+feeds a different total-token count (and document layout) every step. `dynamic=True` is *meant* to
+keep one reusable graph across seqlens — but if its symbolic-shape inference ever degrades to
+per-shape recompilation, it blows past `torch._dynamo.config.cache_size_limit` (default 8) after 8
+distinct shapes and then **silently falls back to eager permanently** (just a warning). That silent
+perf cliff is unacceptable as a training default, and I have only verified the *fixed-shape* loop,
+not a varying-shape stream — so the default is eager (original ~67–95 TFLOPS, recompile-free) and
+compile is opt-in. `dev512/test_varlen_recompile.py` streams 30 differently-shaped varlen batches
+and asserts the recompile count stays bounded + grads stay correct — run it before enabling compile
+for a given training shape distribution. (TODO: run that test on H100 to confirm dynamic=True holds.)
+
+### Fused chunked backward — plan (further perf follow-up)
 
 To make the bwd a fused kernel, head-dim chunk `flash_bwd_sm90.py` by factor 2 (256-wide):
 - Load Q/K/V/dO in 256-wide d-chunks (smem ≈ 4×32KB + sdQaccum 64KB + P/dS ≈ 209KB < 227KB).
@@ -86,23 +109,24 @@ and `epilogue_dKV` — large and pipeline-sensitive.
 
 Gemma 4's head_dim=512 full-attention currently uses query-tiled SDPA + activation
 checkpointing (`GPUPlatform/autotrain/gemma4/attention.py::_packed_sdpa_full`).
-`dev512/compare_attn.py` benchmarks FA-512 (fused fwd + recompute bwd) against it,
-combined fwd+bwd, B=1 H=8 Hkv=4 D=512 bf16 causal on one H100 80GB (outputs/grads match
-within bf16 tol):
+`dev512/compare_attn.py` benchmarks FA-512 (fused fwd + recompute bwd, with
+`FLASH_ATTENTION_LARGE_HEADDIM_COMPILE=1`) against it, combined fwd+bwd, B=1 H=8 Hkv=4 D=512 bf16
+causal on one H100 80GB (outputs/grads match within bf16 tol; default eager bwd is ~2–2.5× slower):
 
 | seqlen | FA-512 mem / fwd+bwd | SDPA-tiled mem / fwd+bwd | naive SDPA |
 |-------:|---------------------:|-------------------------:|-----------:|
-|   4096 |  1.4 GB /     6 ms   |   1.6 GB /    28 ms      | 2.8 GB / 20 ms |
-|   8192 |  2.7 GB /    18 ms   |   3.2 GB /   108 ms      | 9.7 GB / 79 ms |
-|  16384 |  5.4 GB /    64 ms   |   6.4 GB /   420 ms      | 36.6 GB / 314 ms |
-|  32768 | 10.2 GB /   241 ms   |  13.2 GB /  1692 ms      | OOM |
-|  65536 | 21.7 GB /   952 ms   |  28.4 GB /  6747 ms      | OOM |
-| 131072 | 41.0 GB /  3769 ms   |  65.3 GB / 26881 ms      | OOM |
+|   4096 |  1.0 GB /     3 ms   |   1.6 GB /    28 ms      | 2.8 GB / 20 ms |
+|   8192 |  2.1 GB /     8 ms   |   3.2 GB /   109 ms      | 9.7 GB / 79 ms |
+|  16384 |  4.2 GB /    28 ms   |   6.4 GB /   419 ms      | 36.6 GB / 314 ms |
+|  32768 |  8.3 GB /   103 ms   |  13.2 GB /  1692 ms      | OOM |
+|  65536 | 16.5 GB /   400 ms   |  28.4 GB /  6747 ms      | OOM |
+| 131072 | 33.1 GB /  1560 ms   |  65.3 GB / 26881 ms      | OOM |
 
-~5–7× faster fwd+bwd (~20–90× fwd-only), ~25–40% less memory, no O(H·S²) OOM. 128k context
-fits on one 80GB H100 (~41 GB). The recompute bwd is the bottleneck — a fused chunked bwd
-kernel (above) would widen the gap. `gemma4_dynamic_attention.py` is copied from the
-autotrain repo so the comparison is self-contained.
+~10–17× faster fwd+bwd (~22× fwd-only), ~35–50% less memory, no O(H·S²) OOM. 128k context
+fits on one 80GB H100 (~33 GB), leaving room for ~256k. (Was ~5–7× / ~25–40% with the old eager
+recompute bwd — the torch.compile bwd roughly tripled the fwd+bwd advantage and cut memory.)
+`gemma4_dynamic_attention.py` is copied from the autotrain repo so the comparison is
+self-contained.
 
 ## End-to-end logits validation (real Gemma 4)
 
